@@ -152,6 +152,10 @@ def optimize_weights(returns_df, risk_free_rate=0.065, min_return=None,
     except Exception:
         return pd.Series(np.ones(n)/n, index=mu.index)
 
+def normalize_ticker(t):
+    if '.' not in t:  # no suffix, assume NSE
+        return t + ".NS"
+    return t
 # ----------------------------
 # UI: upload / inputs
 # ----------------------------
@@ -182,7 +186,17 @@ if not ensure_trade_cols(trades):
 # Normalize ETF tickers from trades
 trade_etfs = sorted(trades["etf"].astype(str).unique().tolist())
 
-st.info(f"Detected ETFs: {', '.join(trade_etfs)} (will fetch last 6 months from yfinance)")
+def normalize_ticker(t):
+    """Append .NS if no exchange suffix present."""
+    if "." not in t:
+        return t + ".NS"
+    return t
+
+# Keep original names for display, normalized names for fetching
+display_etfs = trade_etfs
+fetch_etfs = [normalize_ticker(etf) for etf in trade_etfs]
+
+st.info(f"Detected ETFs: {', '.join(display_etfs)} (fetching last 6 months from yfinance)")
 
 # --------------
 # Fetch prices (6 months)
