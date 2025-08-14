@@ -179,30 +179,129 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # ---------------------------------------------
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
-from nsepython import equity_history
-import pandas as pd
-from datetime import date, timedelta
+# Replace your previous fetch_prices_3m(...) with this NSE-aware implementation.
+# Requires: pip install nsepython
 
-def fetch_prices_3m_nse(etfs):
-    end = date.today()
-    start = end - timedelta(days=90)
+from datetime import date
+import pandas as pd
+import numpy as np
+import traceback
+import streamlit as st
+
+def fetch_prices_3m_nse(etfs, lookback_days=90):
+    """
+    Fetch ~3 months of daily close prices for the given ETF tickers from NSE via nsepython.
+    - Tries equity_history(symbol, series='EQ', start_date, end_date)
+    - Handles several return shapes (DataFrame, list/dict)
+    - Returns a DataFrame indexed by datetime with one column per available ETF.
+    """
+    try:
+        from nsepython import equity_history
+    except Exception as e:
+        st.warning("nsepython not available (pip install nsepython). Falling back to yfinance or aborting.")
+        return pd.DataFrame()
+
+    end_dt = date.today()
+    start_dt = end_dt - pd.Timedelta(days=lookback_days)
+
     frames = []
+    ok_cols = []
+
+    # helper to normalise the output of equity_history
+    def _normalize_to_series(raw, symbol):
+        """
+        raw: anything returned by equity_history
+        returns: pd.Series indexed by datetime with closing prices named `symbol`,
+                 or None if parsing failed / no useful data.
+        """
+        try:
+            # If already a DataFrame
+            if isinstance(raw, pd.DataFrame):
+                df = raw.copy()
+            else:
+                # Could be list of dicts or dict-of-lists
+                df = pd.DataFrame(raw)
+
+            if df.empty:
+                return None
+
+            # find date-like column
+            date_col = None
+            for c in df.columns:
+                if 'date' in c.lower() or 'timestamp' in c.lower() or 'time' in c.lower() or 'ch_timestamp' in c.lower():
+                    date_col = c
+                    break
+            if date_col is None:
+                # maybe index is already datetime-like
+                if isinstance(df.index, pd.DatetimeIndex):
+                    df = df.reset_index().rename(columns={'index':'__idx'}) 
+                    date_col = '__idx'
+                else:
+                    # try to find any column that parses as date
+                    for c in df.columns:
+                        try:
+                            pd.to_datetime(df[c].iloc[0])
+                            date_col = c
+                            break
+                        except Exception:
+                            continue
+            if date_col is None:
+                return None
+
+            # find close-like column
+            close_col = None
+            close_candidates = [c for c in df.columns if any(k in c.lower() for k in ['close', 'closing', 'ch_closing', 'close_price', 'closeprice', 'last']) ]
+            if close_candidates:
+                close_col = close_candidates[0]
+            else:
+                # try numeric columns excluding date_col
+                numeric_cols = [c for c in df.columns if c != date_col and np.issubdtype(df[c].dtype, np.number)]
+                if numeric_cols:
+                    close_col = numeric_cols[-1]  # last numeric column
+            if close_col is None:
+                return None
+
+            # build series
+            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+            df = df.dropna(subset=[date_col])
+            df = df.sort_values(by=date_col)
+            s = pd.Series(pd.to_numeric(df[close_col], errors='coerce').values,
+                          index=pd.to_datetime(df[date_col]),
+                          name=symbol).dropna()
+            if s.empty:
+                return None
+            # resample to business day and forward-fill (makes it consistent)
+            s = s.resample('D').ffill()
+            return s
+        except Exception:
+            # parsing failed for this symbol
+            return None
+
     for symbol in etfs:
         try:
-            df = equity_history(symbol=symbol,
-                                start_date=start.strftime("%d-%m-%Y"),
-                                end_date=end.strftime("%d-%m-%Y"))
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                df['DATE'] = pd.to_datetime(df['CH_TIMESTAMP'])
-                s = df.set_index('DATE')['CH_CLOSING_PRICE'].rename(symbol)
-                frames.append(s)
-            else:
-                st.warning(f"No NSE data found for {symbol}")
-        except Exception as e:
-            st.warning(f"NSE data fetch failed for {symbol}: {e}")
-    if frames:
-        return pd.concat(frames, axis=1).sort_index().ffill()
-    return pd.DataFrame()
+            # Call equity_history with series='EQ'
+            raw = equity_history(symbol, "EQ", start_dt.strftime("%d-%m-%Y"), end_dt.strftime("%d-%m-%Y"))
+            ser = _normalize_to_series(raw, symbol)
+            if ser is None or ser.dropna().empty:
+                st.warning(f"NSE data fetch returned no usable rows for {symbol}")
+                continue
+            frames.append(ser.rename(symbol))
+            ok_cols.append(symbol)
+        except Exception as exc:
+            # sometimes equity_history can raise various exceptions; don't abort overall run
+            st.warning(f"NSE data fetch failed for {symbol}: {exc}")
+            # optional: debug - uncomment next line during development only
+            # st.write(traceback.format_exc())
+            continue
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=1).sort_index().ffill()
+    # trim to exactly last lookback_days
+    cutoff = pd.Timestamp(end_dt) - pd.Timedelta(days=lookback_days)
+    df = df[df.index >= cutoff]
+    return df
 
     
 prices = fetch_prices_3m_nse(trade_etfs)
