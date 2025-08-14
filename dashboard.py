@@ -180,79 +180,60 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
 # replace your existing fetch_prices_3m with this function
+import yfinance as yf
+import pandas as pd
+from datetime import date, timedelta
+
 def fetch_prices_3m(etfs, lookback_days=90):
     """
-    Fetch last `lookback_days` of daily close prices for the given ETF tickers using yfinance.
-    - Tries ticker formats: SYMBOL.NS then SYMBOL
-    - Returns DataFrame indexed by date with columns = successful ETF symbols
+    Fetch last `lookback_days` of daily close prices for ETFs via yfinance.
+    Skips missing tickers and returns available data only.
     """
-    from datetime import date, timedelta
-    import traceback
 
-    # Defensive check for yfinance
-    if not (hasattr(yf, "download") and callable(yf.download)):
-        st.error("yfinance appears to be unavailable or overwritten. Ensure `import yfinance as yf` at top and restart the app.")
-        return pd.DataFrame()
+    # Known mapping for Indian ETFs to YF tickers
+    ticker_map = {
+        "GOLDBEES": "GOLDBEES.NS",
+        "HDFCSML250": "HDFCSML250.NS",
+        "ITBEES": "ITBEES.NS",
+        "JUNIORBEES": "JUNIORBEES.NS",
+        "MID150CASE": "MID150CASE.NS",
+        "NIFTYBEES": "NIFTYBEES.NS",
+        "SILVERBEES": "SILVERBEES.NS",
+        "SOUTHBANK": "SOUTHBANK.NS",
+    }
+
+    st.info(f"Price data will be fetched for the last ~{lookback_days//30} months "
+            f"({lookback_days} calendar days). Missing tickers are skipped.")
 
     end_dt = date.today()
     start_dt = end_dt - timedelta(days=lookback_days)
 
-    frames = []
-    successful = []
+    prices = pd.DataFrame()
 
-    for symbol in etfs:
-        symbol = str(symbol).strip().upper()
-        tried = []
-        got = False
+    for etf in etfs:
+        yf_symbol = ticker_map.get(etf, None)
+        if not yf_symbol:
+            st.warning(f"No Yahoo Finance mapping found for {etf}. Skipping.")
+            continue
 
-        ticker_candidates = [f"{symbol}.NS", symbol]
-
-        for tkr in ticker_candidates:
-            tried.append(tkr)
-            try:
-                df = yf.download(
-                    tkr,
-                    start=start_dt.strftime("%Y-%m-%d"),
-                    end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
-                    progress=False,
-                    threads=False,
-                )
-                if df is None or df.empty or "Close" not in df.columns:
-                    continue
-
-                # Extract close series safely and avoid ambiguous rename(...)
-                s = df["Close"].dropna().copy()
-                if s.empty:
-                    continue
-
-                # ensure datetime index and forward-fill calendar days
-                s.index = pd.to_datetime(s.index)
-                s = s.sort_index().asfreq("D").ffill()
-                s.name = symbol   # set series name explicitly (avoid Series.rename ambiguity)
-                frames.append(s)
-                successful.append(symbol)
-                got = True
-                break
-
-            except Exception as e:
-                st.warning(f"yfinance fetch failed for {symbol} using ticker '{tkr}': {e}")
-                st.text(traceback.format_exc())
+        try:
+            df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
+            if df.empty or "Close" not in df.columns:
+                st.warning(f"No price data found for {etf} (tried: {yf_symbol}). Skipping.")
                 continue
 
-        if not got:
-            st.info(f"No price data found for {symbol} (tried: {tried}). Skipping.")
+            s = df["Close"].dropna()
+            s.name = etf
+            prices = pd.concat([prices, s], axis=1)
+        except Exception as e:
+            st.error(f"yfinance fetch failed for {etf} using ticker '{yf_symbol}': {e}")
+            continue
 
-    if not frames:
-        return pd.DataFrame()
+    if prices.empty:
+        st.error("No price data downloaded for any ETF. Aborting.")
+        return None
 
-    # concat and trim to lookback window
-    df_all = pd.concat(frames, axis=1).sort_index().ffill()
-    cutoff = pd.Timestamp(end_dt) - pd.Timedelta(days=lookback_days)
-    df_all = df_all[df_all.index >= cutoff]
-
-    # final sanity: drop all-NaN columns
-    df_all = df_all.dropna(axis=1, how="all")
-    return df_all
+    return prices
 
    
 prices = fetch_prices_3m(trade_etfs, lookback_days=90)
