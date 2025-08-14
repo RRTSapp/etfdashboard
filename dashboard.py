@@ -353,7 +353,7 @@ def fetch_prices_3m_combined(etfs, lookback_days=90, verbose=True):
     return df_all
 
     
-prices = fetch_prices_3m_nse(trade_etfs)
+prices = fetch_prices_3m_combined(trade_etfs, lookback_days=90)
 if prices.empty:
     st.error("No price data downloaded for any ETF. Aborting.")
     st.stop()
