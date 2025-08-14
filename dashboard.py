@@ -179,42 +179,28 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # ---------------------------------------------
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
-def fetch_prices_3m(etfs):
-    if not etfs:
-        return pd.DataFrame()
-    # Map to .NS and plain as fallback attempts
-    attempts = {}
-    for e in etfs:
-        attempts[e] = [f"{e}.NS", e]  # try NSE, then raw symbol
-    end = datetime.utcnow()
-    start = end - timedelta(days=LOOKBACK_DAYS+10)
+from nsepython import equity_history
+import pandas as pd
+from datetime import date, timedelta
 
+def fetch_prices_3m_nse(etfs):
+    end = date.today()
+    start = end - timedelta(days=90)
     frames = []
-    ok_cols = []
-    for etf in etfs:
-        got = None
-        for sym in attempts[etf]:
-            try:
-                d = yf.download(sym, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
-                if not d.empty and "Close" in d.columns:
-                    s = d["Close"].copy().rename(etf).dropna()
-                    got = s
-                    break
-            except Exception:
-                continue
-        if got is None or got.dropna().empty:
-            st.warning(f"Price data not found for **{etf}** (tried {attempts[etf]}). Skipping.")
-            continue
-        frames.append(got)
-        ok_cols.append(etf)
-    if not frames:
-        return pd.DataFrame()
-    df = pd.concat(frames, axis=1).sort_index().ffill()
-    # keep only last ~90 days
-    df = df[df.index >= (end - timedelta(days=LOOKBACK_DAYS))]
-    return df
-
-prices = fetch_prices_3m(trade_etfs)
+    for symbol in etfs:
+        try:
+            df = equity_history(symbol, start, end)
+            if not df.empty:
+                df['DATE'] = pd.to_datetime(df['CH_TIMESTAMP'])
+                s = df.set_index('DATE')['CH_CLOSING_PRICE'].rename(symbol)
+                frames.append(s)
+        except Exception as e:
+            st.warning(f"NSE data fetch failed for {symbol}: {e}")
+    if frames:
+        return pd.concat(frames, axis=1).sort_index().ffill()
+    return pd.DataFrame()
+    
+prices = fetch_prices_3m_nse(trade_etfs)
 if prices.empty:
     st.error("No price data downloaded for any ETF. Aborting.")
     st.stop()
