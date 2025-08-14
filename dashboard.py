@@ -180,7 +180,7 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
 def fetch_prices_3m(etfs, lookback_days=90):
-    from datetime import datetime, timedelta
+    from datetime import date, timedelta
     """Fetch last `lookback_days` of daily close prices for ETFs via yfinance only."""
     end_dt = date.today()
     start_dt = end_dt - timedelta(days=lookback_days)
@@ -199,7 +199,7 @@ def fetch_prices_3m(etfs, lookback_days=90):
             st.warning(f"yfinance fetch failed for {symbol}: {e}")
             continue
     if not frames:
-        return pd.DataFrame()
+       return pd.DataFrame()
     return pd.concat(frames, axis=1).ffill()
    
 prices = fetch_prices_3m(trade_etfs, lookback_days=90)
