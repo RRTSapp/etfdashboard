@@ -180,6 +180,7 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
 def fetch_prices_3m(etfs, lookback_days=90):
+    from datetime import date, timedelta
     """
     Fetch ~3 months of daily close prices for given ETFs using:
     1. nsepython.get_history
