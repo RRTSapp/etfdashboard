@@ -216,23 +216,8 @@ def fetch_prices_3m(etfs, lookback_days=90):
             except Exception as e:
                 st.warning(f"yfinance fetch failed for {etf} using ticker '{yf_symbol}': {e}")
 
-            try:
-                df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
-                if df.empty or "Close" not in df.columns:
-                    st.warning(f"No price data for {etf} ({yf_symbol}). Skipping.")
-                    continue
-                s = df["Close"].dropna()
-                s.name = etf
-                prices = pd.concat([prices, s], axis=1)
-            except Exception as e:
-                st.warning(f"{etf} fetch failed: {e}")
-                continue
-
-        if prices.empty:
-            st.error("No price data fetched for any ETF. Proceeding without charts/backtests.")
-        else:
-            st.success(f"Fetched data for {len(prices.columns)} ETFs: {', '.join(prices.columns)}")
-
+            if not fetched:
+            st.warning(f"Price data not found for {etf} (tried: {possible_symbols}). Skipping.")
         return prices
 
 
