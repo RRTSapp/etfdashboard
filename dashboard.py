@@ -192,7 +192,7 @@ def fetch_prices_3m(etfs, lookback_days=90):
         "MID150CASE": "MID150CASE.NS",
         "NIFTYBEES": "NIFTYBEES.NS",
         "SILVERBEES": "SILVERBEES.NS",
-        "SOUTHBANK": "SOUTHBANK.NS",
+        "SOUTHBANK": "SOUTHBANK.NS"
     }
 
     st.info(f"Price data will be fetched for the last ~{lookback_days//30} months "
