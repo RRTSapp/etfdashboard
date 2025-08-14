@@ -189,16 +189,21 @@ def fetch_prices_3m_nse(etfs):
     frames = []
     for symbol in etfs:
         try:
-            df = equity_history(symbol, start, end)
-            if not df.empty:
+            df = equity_history(symbol=symbol,
+                                start_date=start.strftime("%d-%m-%Y"),
+                                end_date=end.strftime("%d-%m-%Y"))
+            if isinstance(df, pd.DataFrame) and not df.empty:
                 df['DATE'] = pd.to_datetime(df['CH_TIMESTAMP'])
                 s = df.set_index('DATE')['CH_CLOSING_PRICE'].rename(symbol)
                 frames.append(s)
+            else:
+                st.warning(f"No NSE data found for {symbol}")
         except Exception as e:
             st.warning(f"NSE data fetch failed for {symbol}: {e}")
     if frames:
         return pd.concat(frames, axis=1).sort_index().ffill()
     return pd.DataFrame()
+
     
 prices = fetch_prices_3m_nse(trade_etfs)
 if prices.empty:
