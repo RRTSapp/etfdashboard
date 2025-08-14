@@ -179,18 +179,11 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # ---------------------------------------------
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
-# replace your existing fetch_prices_3m with this function
 import yfinance as yf
 import pandas as pd
 from datetime import date, timedelta
 
 def fetch_prices_3m(etfs, lookback_days=90):
-    """
-    Fetch last `lookback_days` of daily close prices for ETFs via yfinance.
-    Skips missing tickers and returns available data only.
-    """
-
-    # Known mapping for Indian ETFs to YF tickers
     ticker_map = {
         "GOLDBEES": "GOLDBEES.NS",
         "HDFCSML250": "HDFCSML250.NS",
@@ -207,33 +200,33 @@ def fetch_prices_3m(etfs, lookback_days=90):
 
     end_dt = date.today()
     start_dt = end_dt - timedelta(days=lookback_days)
-
     prices = pd.DataFrame()
 
     for etf in etfs:
-        yf_symbol = ticker_map.get(etf, None)
+        yf_symbol = ticker_map.get(etf)
         if not yf_symbol:
-            st.warning(f"No Yahoo Finance mapping found for {etf}. Skipping.")
+            st.warning(f"No Yahoo mapping for {etf}, skipping.")
             continue
 
         try:
             df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
             if df.empty or "Close" not in df.columns:
-                st.warning(f"No price data found for {etf} (tried: {yf_symbol}). Skipping.")
+                st.warning(f"No price data for {etf} ({yf_symbol}). Skipping.")
                 continue
-
             s = df["Close"].dropna()
             s.name = etf
             prices = pd.concat([prices, s], axis=1)
         except Exception as e:
-            st.error(f"yfinance fetch failed for {etf} using ticker '{yf_symbol}': {e}")
+            st.warning(f"{etf} fetch failed: {e}")
             continue
 
     if prices.empty:
-        st.error("No price data downloaded for any ETF. Aborting.")
-        return None
+        st.error("No price data fetched for any ETF. Proceeding without charts/backtests.")
+    else:
+        st.success(f"Fetched data for {len(prices.columns)} ETFs: {', '.join(prices.columns)}")
 
     return prices
+
 
    
 prices = fetch_prices_3m(trade_etfs, lookback_days=90)
