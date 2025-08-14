@@ -1,560 +1,513 @@
 # dashboard.py
-import streamlit as st
-import pandas as pd
-import numpy as np
+import io
+import math
+import warnings
 from datetime import datetime, timedelta
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+import numpy_financial as npf
 import plotly.graph_objects as go
 import plotly.express as px
 import matplotlib.pyplot as plt
-from matplotlib.ticker import FuncFormatter, PercentFormatter
-from scipy.optimize import minimize
-import yfinance as yf
+from matplotlib.ticker import FuncFormatter
 
-# Try to import nsepython but don't fail if unavailable
-try:
-    from nsepython import equity_history
-    NSE_AVAILABLE = True
-except Exception:
-    NSE_AVAILABLE = False
+warnings.filterwarnings("ignore")
 
-# ============== Config ==============
+# ---------------------------------------------
+# App config
+# ---------------------------------------------
 st.set_page_config(page_title="ETF SIP Dashboard (Public)", layout="wide")
-st.title("📊 ETF SIP Dashboard — Public")
+st.title("📊 ETF SIP Dashboard (Public)")
 
-DEFAULT_MONTHS = 3        # fetch window for public dashboard
-FD_RATE = 0.065           # benchmark FD (6.5% p.a.)
-N_MONTE = 2000            # default Monte Carlo sims (kept moderate)
-RISK_FREE = FD_RATE
+# Defaults
+DEFAULT_FD_RATE = 0.065   # 6.5% annual
+DEFAULT_MONTHLY_SIP = 15000
+RISK_FREE = 0.065
+LOOKBACK_DAYS = 90        # ~3 months
 
-# ============== Helpers ==============
-@st.cache_data(ttl=60*60)  # cache for 1 hour
-def load_trades(path="trades.csv"):
-    df = pd.read_csv(path)
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"], dayfirst=True, errors='coerce')
-    else:
-        df["date"] = pd.NaT
-    return df
-
-def try_fetch_nse(etf, start, end):
-    if not NSE_AVAILABLE:
-        return pd.DataFrame()
+# ---------------------------------------------
+# Helpers
+# ---------------------------------------------
+def format_money(x, zero_dash=True):
+    if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
+        return "—" if zero_dash else "₹0"
     try:
-        raw = equity_history(symbol=etf,
-                             from_date=start.strftime("%d-%m-%Y"),
-                             to_date=end.strftime("%d-%m-%Y"),
-                             series="EQ")
-        if raw is None or raw.empty:
-            return pd.DataFrame()
-        # expect CH_TIMESTAMP, CH_CLOSING_PRICE
-        if "CH_CLOSING_PRICE" in raw.columns:
-            df = raw[["CH_TIMESTAMP","CH_CLOSING_PRICE"]].copy()
-            df.columns = ["Date", etf]
-            df["Date"] = pd.to_datetime(df["Date"])
-            df = df.set_index("Date").sort_index()
-            return df
-        return pd.DataFrame()
+        return f"₹{x:,.0f}"
     except Exception:
-        return pd.DataFrame()
-
-def try_fetch_yf(etf, start, end):
-    # try .NS first, then bare symbol
-    for symbol in (f"{etf}.NS", etf):
-        try:
-            df = yf.download(symbol, start=start, end=end, progress=False)
-            if df is None or df.empty:
-                continue
-            if "Close" in df.columns:
-                s = df["Close"].rename(etf)
-                s.index.name = "Date"
-                return s.to_frame()
-        except Exception:
-            continue
-    return pd.DataFrame()
-
-@st.cache_data(ttl=60*60)
-def fetch_price_data(etfs, months=DEFAULT_MONTHS):
-    end = datetime.now()
-    start = end - timedelta(days=30*months)
-    price_df = pd.DataFrame()
-    fetched = []
-    for etf in etfs:
-        # priority: NSE -> yfinance
-        df = try_fetch_nse(etf, start, end)
-        if df.empty:
-            df = try_fetch_yf(etf, start, end)
-        if df.empty:
-            st.warning(f"Price data not found for {etf}; it will be skipped.")
-            continue
-        # unify column
-        if isinstance(df, pd.DataFrame) and etf not in df.columns:
-            # maybe single-col series with name etc
-            df.columns = [etf]
-        if price_df.empty:
-            price_df = df.copy()
-        else:
-            price_df = price_df.join(df, how="outer")
-        fetched.append(etf)
-    if price_df.empty:
-        return pd.DataFrame()
-    price_df = price_df.sort_index().ffill()
-    return price_df
-
-def compute_xirr(cashflows):
-    # cashflows: list of (date, amount) with negative for contributions, final positive value
-    try:
-        dates, amounts = zip(*sorted(cashflows, key=lambda x: x[0]))
-        dates = pd.to_datetime(dates)
-        # convert days to year fractions
-        def npv(rate):
-            return sum([amt / ((1 + rate) ** ((d - dates[0]).days / 365.0)) for d, amt in zip(dates, amounts)])
-        # newton
-        from scipy.optimize import newton
-        try:
-            return newton(npv, 0.1)
-        except Exception:
-            return float("nan")
-    except Exception:
-        return float("nan")
-
-def format_money(x):
-    if pd.isna(x):
         return "—"
-    return f"₹{x:,.0f}"
 
-# optimizer for weights with dynamic bounds
-def optimize_weights(returns,
-                     risk_free_rate=RISK_FREE,
-                     min_weight=None,
-                     max_weight=None):
+def safe_xirr(cashflows):
     """
-    returns: DataFrame of returns (periodic)
-    min_weight/max_weight: scalars applied per asset (None => 0,1)
-    Returns pd.Series of weights summing to 1
+    cashflows: list of (date, amount) tuples. Negative for investments, positive for redemption.
+    Returns a float (annualized) or None if not solvable.
     """
-    returns = returns.dropna(axis=1, how='all').dropna(how='all')
-    if returns.shape[1] == 0:
-        return pd.Series(dtype=float)
-    mu = returns.mean()
-    cov = returns.cov()
+    if not cashflows:
+        return None
+    # Convert to days since first date
+    cashflows = sorted(cashflows, key=lambda x: x[0])
+    t0 = cashflows[0][0]
+    amounts = [cf[1] for cf in cashflows]
+    days = [(cf[0] - t0).days for cf in cashflows]
+    # If all same sign, IRR undefined
+    if all(a >= 0 for a in amounts) or all(a <= 0 for a in amounts):
+        return None
+    # Use IRR on irregular periods → try Newton by converting to periodic with day fractions
+    def xnpv(rate):
+        return sum(a / ((1 + rate) ** (d/365.0)) for a, d in zip(amounts, days))
+    # bracket search then Newton
+    try:
+        # coarse bracket
+        low, high = -0.999, 5.0
+        for _ in range(60):
+            mid = (low + high) / 2
+            val = xnpv(mid)
+            if abs(val) < 1e-8:
+                return mid
+            # move bracket
+            val_low = xnpv(low)
+            # bisection
+            if (val_low > 0 and val < 0) or (val_low < 0 and val > 0):
+                high = mid
+            else:
+                low = mid
+        return mid
+    except Exception:
+        return None
 
-    def neg_sharpe(w):
-        port_ret = w @ mu
-        vol = np.sqrt(w @ cov.values @ w)
-        return -(port_ret - (risk_free_rate/252 if returns.shape[0]>1 else 0)) / vol if vol > 0 else 0
+def pct_to_str(x):
+    if x is None or (isinstance(x, float) and (np.isnan(x) or np.isinf(x))):
+        return "—"
+    try:
+        return f"{x*100:.2f}%"
+    except Exception:
+        return "—"
 
-    n = len(mu)
-    x0 = np.ones(n) / n
-    bounds = []
-    for _ in range(n):
-        lo = 0.0 if min_weight is None else min_weight
-        hi = 1.0 if max_weight is None else max_weight
-        bounds.append((lo, hi))
-    cons = ({'type': 'eq', 'fun': lambda w: w.sum() - 1},)
-    res = minimize(neg_sharpe, x0, bounds=bounds, constraints=cons)
-    w = np.clip(res.x, 0, 1)
-    if w.sum() == 0:
-        w = np.ones(n) / n
-    return pd.Series(w / w.sum(), index=mu.index)
+def compute_fd_value(lumpsum: float, months: int, annual_rate: float) -> float:
+    """Future value of a lumpsum compounded monthly at given annual_rate."""
+    mrate = annual_rate / 12
+    return lumpsum * ((1 + mrate) ** months)
 
-# efficient frontier random simulation
-def simulate_efficient_frontier(returns, n_portf=3000, rf=RISK_FREE):
-    mu = returns.mean() * 252
-    cov = returns.cov() * 252
-    n = len(mu)
-    results = np.zeros((3, n_portf))
-    weights = []
-    for i in range(n_portf):
-        w = np.random.dirichlet(np.ones(n))
-        weights.append(w)
-        port_ret = w @ mu
-        port_vol = np.sqrt(w @ cov.values @ w)
-        port_sr = (port_ret - rf) / port_vol if port_vol > 0 else 0
-        results[:, i] = [port_vol, port_ret, port_sr]
-    ef = pd.DataFrame(results.T, columns=["Volatility","Return","Sharpe"])
-    return ef, weights
+def compute_fd_with_sip(current_value, monthly_sip, years, annual_rate):
+    """FD projection with principal (current value + monthly SIP annuity)."""
+    mrate = annual_rate / 12
+    n = years * 12
+    fv_lump = current_value * ((1 + mrate) ** n)
+    fv_sip  = monthly_sip * (((1 + mrate) ** n - 1) / mrate)
+    return fv_lump + fv_sip
 
-# simple SIP monthly simulator
-def simulate_sip(prices, months_sip=36, sip_amount=15000, window=30, sigma=1.0, min_sharpe=0.2):
-    """
-    Simple monthly SIP simulation:
-    - months_sip: number of months to simulate (we will use actual price history length if shorter)
-    - sip_amount: monthly SIP
-    - allocation: allocate equally among 'eligible' ETFs (here we simply allocate equally)
-    This is a simplified implementation for public view.
-    """
-    # ensure monthly spaced dates available in prices (use month starts)
-    idx = prices.index.dropna()
-    if idx.empty:
+def monthly_heatmap(returns_daily: pd.Series):
+    monthly = returns_daily.resample("M").apply(lambda x: (1 + x).prod() - 1)
+    df = monthly.to_frame("Return").copy()
+    df["Year"] = df.index.year
+    df["Month"] = df.index.strftime("%b")
+    pivot = df.pivot_table(index="Year", columns="Month", values="Return", aggfunc="mean")
+    # reorder months
+    months_order = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    pivot = pivot.reindex(columns=[m for m in months_order if m in pivot.columns])
+    return pivot
+
+def annualize_daily(mu_d, sigma_d):
+    mu_ann = mu_d * 252
+    sig_ann = sigma_d * np.sqrt(252)
+    return mu_ann, sig_ann
+
+def max_sharpe_weights(mu_vec, cov_mat, rf=RISK_FREE):
+    """Max Sharpe using analytic solution (no bounds). Fall back to numeric if needed."""
+    try:
+        inv = np.linalg.pinv(cov_mat)
+        ones = np.ones(len(mu_vec))
+        # tangency weights proportional to inv*(mu - rf)
+        w = inv @ (mu_vec - rf*ones)
+        w = np.clip(w, 0, None)
+        if w.sum() == 0:
+            w = np.ones_like(w)
+        w = w / w.sum()
+        return w
+    except Exception:
+        # fallback equal-weight
+        n = len(mu_vec)
+        return np.ones(n)/n
+
+def drawdown_curve(series: pd.Series) -> pd.Series:
+    cummax = series.cummax()
+    dd = series/cummax - 1.0
+    return dd
+
+def calc_equity_curve(prices: pd.DataFrame, weights: pd.Series, start_val=100.0) -> pd.Series:
+    w = weights.reindex(prices.columns).fillna(0).values
+    rets = prices.pct_change().dropna()
+    port = (rets @ w) + 1
+    equity = pd.Series(np.r_[start_val, start_val*port.cumprod().values], index=prices.index)
+    return equity
+
+# ---------------------------------------------
+# Upload trades.csv
+# ---------------------------------------------
+st.sidebar.header("📥 Upload your trades.csv")
+trades_file = st.sidebar.file_uploader("Upload trades.csv (columns: date, etf, units, price)", type=["csv"])
+
+if trades_file is None:
+    st.info("Upload a **trades.csv** to continue. Expected columns: `date, etf, units, price`.")
+    st.stop()
+
+# Read trades
+try:
+    trades = pd.read_csv(trades_file)
+except Exception as e:
+    st.error(f"Could not read trades.csv: {e}")
+    st.stop()
+
+# Normalize
+required_cols = {"date","etf","units","price"}
+missing = required_cols - set(c.lower() for c in trades.columns)
+if missing:
+    st.error(f"trades.csv is missing columns: {', '.join(missing)}")
+    st.stop()
+
+trades.columns = [c.lower() for c in trades.columns]
+trades["date"] = pd.to_datetime(trades["date"], errors="coerce")
+trades = trades.dropna(subset=["date","etf","units","price"])
+trades["etf"] = trades["etf"].astype(str).str.strip().str.upper()
+trade_etfs = sorted(trades["etf"].unique().tolist())
+
+st.success(f"Detected ETFs: {', '.join(trade_etfs)}")
+st.caption("Price data will be fetched for the last ~3 months (90 calendar days). Missing tickers are skipped.")
+
+# ---------------------------------------------
+# Fetch last 3 months prices (daily) - yfinance
+# ---------------------------------------------
+def fetch_prices_3m(etfs):
+    if not etfs:
         return pd.DataFrame()
-    # build month starts within available range
-    last = idx[-1]
-    first = idx[0]
-    ms = pd.date_range(start=first, end=last, freq="MS")
-    month_dates = [d for d in ms if d <= last]
-    portfolio_units = {c:0.0 for c in prices.columns}
-    total_invested = 0.0
-    history = []
-    for i, dt in enumerate(month_dates):
-        # find nearest trading day >= dt
-        pos = prices.index.searchsorted(dt)
-        if pos >= len(prices): break
-        date_actual = prices.index[pos]
-        px = prices.loc[date_actual]
-        # choose eligible ETFs: those with price data on that day
-        eligible = [c for c in prices.columns if not pd.isna(px[c])]
-        if not eligible: continue
-        per = sip_amount / len(eligible)
-        for e in eligible:
-            portfolio_units[e] += per / px[e]
-        total_invested += sip_amount
-        port_val = sum(portfolio_units[e] * px[e] for e in prices.columns if not pd.isna(px.get(e, np.nan)))
-        # FD compounding monthly from start of SIPs
-        m = len(history) + 1
-        fd_val = sip_amount * (((1 + FD_RATE/12) ** m - 1) / (FD_RATE/12))
-        history.append({"Date":date_actual, "Invested": total_invested, "Portfolio": port_val, "FD": fd_val})
-    if not history:
+    # Map to .NS and plain as fallback attempts
+    attempts = {}
+    for e in etfs:
+        attempts[e] = [f"{e}.NS", e]  # try NSE, then raw symbol
+    end = datetime.utcnow()
+    start = end - timedelta(days=LOOKBACK_DAYS+10)
+
+    frames = []
+    ok_cols = []
+    for etf in etfs:
+        got = None
+        for sym in attempts[etf]:
+            try:
+                d = yf.download(sym, start=start, end=end, interval="1d", auto_adjust=True, progress=False)
+                if not d.empty and "Close" in d.columns:
+                    s = d["Close"].copy().rename(etf).dropna()
+                    got = s
+                    break
+            except Exception:
+                continue
+        if got is None or got.dropna().empty:
+            st.warning(f"Price data not found for **{etf}** (tried {attempts[etf]}). Skipping.")
+            continue
+        frames.append(got)
+        ok_cols.append(etf)
+    if not frames:
         return pd.DataFrame()
-    df = pd.DataFrame(history).set_index("Date")
-    df["Gain"] = df["Portfolio"] - df["Invested"]
-    yrs = (df.index[-1] - df.index[0]).days / 365.25
-    df["CAGR"] = ((df["Portfolio"] / df["Invested"]) ** (1/yrs) - 1).replace([np.inf, -np.inf], np.nan)
+    df = pd.concat(frames, axis=1).sort_index().ffill()
+    # keep only last ~90 days
+    df = df[df.index >= (end - timedelta(days=LOOKBACK_DAYS))]
     return df
 
-# ========================
-# Start App Execution
-# ========================
-# 1) Load trades
-try:
-    trades = load_trades("trades.csv")
-except FileNotFoundError:
-    st.error("trades.csv not found. Place trades.csv in the app folder and try again.")
-    st.stop()
-
-if trades.empty:
-    st.error("No rows in trades.csv.")
-    st.stop()
-
-# 2) Detect ETFs
-trade_etfs = sorted(trades["etf"].astype(str).unique().tolist())
-st.info(f"Detected ETFs: {', '.join(trade_etfs)} — fetching last {DEFAULT_MONTHS} months of prices (NSE → Yahoo fallback)")
-
-# 3) Fetch price data
-prices = fetch_price_data(trade_etfs, months=DEFAULT_MONTHS)
+prices = fetch_prices_3m(trade_etfs)
 if prices.empty:
-    st.error("No price data available for any ETF. Aborting.")
+    st.error("No price data downloaded for any ETF. Aborting.")
     st.stop()
 
-# 4) Prepare holdings (units, invested amounts)
-latest = prices.dropna(how="all").index.max()
-units = trades.groupby("etf")["units"].sum()
-amounts = trades.groupby("etf")["amount"].sum()
-avg_cost = (amounts / units).replace([np.inf, -np.inf], np.nan)
-total_inv = amounts.sum()
+avail_etfs = [c for c in prices.columns if c in trade_etfs]
+if not avail_etfs:
+    st.error("Trades detected, but none have price data. Aborting.")
+    st.stop()
 
-# 5) Build daily holdings (fills from trades)
-# create a full daily index across fetched prices to align holdings
-full_dates = pd.date_range(prices.index.min(), prices.index.max(), freq='D')
-holds = (
-    trades
-    .pivot_table(index="date", columns="etf", values="units", aggfunc="sum")
-    .reindex(full_dates)
-    .fillna(0)
-    .cumsum()
+prices = prices[avail_etfs].ffill()
+latest_date = prices.index.max()
+st.caption(f"Prices range: {prices.index.min().date()} → {latest_date.date()}")
+
+# ---------------------------------------------
+# Current holdings & metrics from trades
+# ---------------------------------------------
+grouped = trades.groupby("etf", as_index=True).agg(
+    units=("units","sum"),
+    invested=("price", lambda s: (s*trades.loc[s.index,"units"]).sum())
 )
-holds.index.name = "date"
+# Weighted avg cost per ETF
+avg_cost = []
+for etf in grouped.index:
+    sub = trades[trades["etf"]==etf]
+    inv = (sub["price"]*sub["units"]).sum()
+    u = sub["units"].sum()
+    avg_cost.append(inv/u if u!=0 else np.nan)
+grouped["avg_cost"] = avg_cost
 
-# 6) Ensure we only use ETFs that have price data
-avail_hold_etfs = [e for e in trade_etfs if e in prices.columns and not prices[e].dropna().empty]
-if not avail_hold_etfs:
-    st.error("None of the ETFs in trades.csv have price data. Aborting.")
-    st.stop()
+units = grouped["units"]
+avg_cost_s = grouped["avg_cost"]
 
-curr_px = prices.loc[latest, avail_hold_etfs]
-current_val = (units.reindex(avail_hold_etfs).fillna(0) * curr_px).sum()
+curr_px = prices.loc[latest_date, avail_etfs]
+vals = units.reindex(avail_etfs).fillna(0) * curr_px.reindex(avail_etfs).fillna(0)
+current_val = float(vals.sum())
+total_inv = float((avg_cost_s.reindex(avail_etfs).fillna(0) * units.reindex(avail_etfs).fillna(0)).sum())
 
-# 7) Build cashflows for XIRR and compute
-cashflows = []
-for _, r in trades.iterrows():
-    # contributions (negative amounts since invested)
-    try:
-        d = pd.to_datetime(r["date"])
-    except:
-        continue
-    cashflows.append((d, -float(r.get("amount", 0))))
-# terminal value positive
-cashflows.append((latest, float(current_val)))
-xirr = compute_xirr(cashflows)
-if not np.isfinite(xirr):
-    xirr_display = "—"
-else:
-    xirr_display = f"{xirr*100:.2f}%"
+# Build XIRR cashflows from trades + current portfolio value as redemption
+cf = []
+for _, row in trades.iterrows():
+    # cash outflow (buy) = negative
+    cf.append((row["date"].to_pydatetime(), -float(row["price"])*float(row["units"])))
+# Add final "sale" today = current portfolio value
+cf.append((latest_date.to_pydatetime(), current_val))
+xirr = safe_xirr(cf)  # None if invalid
 
-# ---------- Layout: Tabs to keep original layout ----------
-tab1, tab2, tab3, tab4 = st.tabs(["Portfolio & Backtest","Charts","Projections & Monte Carlo","Tools / Others"])
+# ---------------------------------------------
+# Tabs
+# ---------------------------------------------
+tab1, tab2, tab3 = st.tabs(["📒 Portfolio & Backtest", "📈 Charts", "🔮 Future Projections"])
 
-# ---------- TAB 1: Portfolio & Backtest ----------
+# ---------------------------------------------
+# TAB 1: Portfolio & Backtest
+# ---------------------------------------------
 with tab1:
-    st.subheader("🗃 Portfolio Overview")
-    # summary DataFrame
-    vals = units.reindex(avail_hold_etfs).fillna(0) * curr_px
-    df_port = pd.DataFrame({
-        "Units": units.reindex(avail_hold_etfs).fillna(0),
-        "Avg Cost (₹)": avg_cost.reindex(avail_hold_etfs).fillna(0).round(2),
-        "Curr Price (₹)": curr_px.round(2),
-        "Value (₹)": vals.round(0),
+    colA, colB, colC = st.columns(3)
+    colA.metric("💸 Total Invested", format_money(total_inv))
+    colB.metric("📈 Current Value", format_money(current_val))
+    colC.metric("🚀 XIRR", pct_to_str(xirr) if xirr is not None else "—")
+
+    # Per-ETF summary table
+    df = pd.DataFrame({
+        "Units":           units.reindex(avail_etfs).fillna(0),
+        "Avg Cost (₹)":    avg_cost_s.reindex(avail_etfs).fillna(0).round(2),
+        "Curr Price (₹)":  curr_px.round(2),
+        "Value (₹)":       vals.round(0),
     })
-    df_port["Invested (₹)"] = (df_port["Units"] * df_port["Avg Cost (₹)"]).round(0)
-    df_port["Gain/Loss (₹)"] = (df_port["Value (₹)"] - df_port["Invested (₹)"]).round(2)
-    df_port["Gain/Loss %"] = ((df_port["Gain/Loss (₹)"] / df_port["Invested (₹)"]) * 100).round(2)
-    df_port["% of Portfolio"] = (df_port["Value (₹)"] / df_port["Value (₹)"].sum() * 100).round(2)
+    df["Invested (₹)"]   = (df["Units"] * df["Avg Cost (₹)"]).round(0)
+    df["Gain/Loss (₹)"]  = (df["Value (₹)"] - df["Invested (₹)"]).round(2)
+    df["Gain/Loss %"]    = np.where(df["Invested (₹)"]>0,
+                                    (df["Gain/Loss (₹)"]/df["Invested (₹)"])*100, np.nan).round(2)
+    df["% of Portfolio"] = np.where(df["Value (₹)"].sum()>0,
+                                    (df["Value (₹)"]/df["Value (₹)"].sum()*100).round(2), 0.0)
 
-    def color_gain(val):
-        if pd.isna(val): return ""
-        return f"color: {'green' if val>0 else 'red' if val<0 else 'black'}"
+    c1, c2 = st.columns((3,2))
+    with c1:
+        styled = (df.style
+                    .format({
+                        "Avg Cost (₹)":     "₹{:,.2f}",
+                        "Curr Price (₹)":   "₹{:,.2f}",
+                        "Value (₹)":        "₹{:,.0f}",
+                        "Invested (₹)":     "₹{:,.0f}",
+                        "Gain/Loss (₹)":    "₹{:,.2f}",
+                        "Gain/Loss %":      "{:.2f}%",
+                        "% of Portfolio":   "{:.2f}%"
+                    })
+                    .apply(lambda s: ['color: green' if v>0 else ('color: red' if v<0 else '') 
+                                      for v in df["Gain/Loss (₹)"]], axis=0, subset=["Gain/Loss (₹)"])
+                    .set_properties(**{"text-align":"center"})
+                 )
+        st.dataframe(styled, use_container_width=True, height=380)
 
-    col1, col2 = st.columns((3,2))
-    with col1:
-        st.dataframe(
-            df_port.style.format({
-                "Avg Cost (₹)": "₹{:,.2f}",
-                "Curr Price (₹)": "₹{:,.2f}",
-                "Value (₹)": "₹{:,.0f}",
-                "Invested (₹)": "₹{:,.0f}",
-                "Gain/Loss (₹)": "₹{:,.2f}",
-                "Gain/Loss %": "{:.2f}%",
-                "% of Portfolio": "{:.2f}%"
-            }).applymap(color_gain, subset=["Gain/Loss (₹)","Gain/Loss %"])
-            .set_properties(**{"text-align":"center"}),
-            use_container_width=True
-        )
-    with col2:
-        slice_vals = vals[vals > 0]
+    with c2:
+        slice_vals = df.loc[df["Value (₹)"]>0, "Value (₹)"]
         if not slice_vals.empty:
-            fig_pie = go.Figure(go.Pie(labels=slice_vals.index.tolist(), values=slice_vals.values.tolist(),
-                                       hole=0.4, textinfo="label+percent"))
-            fig_pie.update_layout(title="Portfolio Allocation", margin=dict(t=20,b=20), height=300)
+            fig_pie = go.Figure(go.Pie(
+                labels=slice_vals.index.tolist(),
+                values=slice_vals.values.tolist(),
+                hole=0.4,
+                textinfo="label+percent",
+            ))
+            fig_pie.update_layout(title="Portfolio Allocation", margin=dict(t=20,b=20), height=320)
             st.plotly_chart(fig_pie, use_container_width=True)
         else:
-            st.info("No holdings to display in pie chart.")
+            st.info("No positive holdings to display.")
 
-    m1,m2,m3,m4,m5 = st.columns(5)
-    m1.metric("💸 Total Invested", format_money(total_inv))
-    m2.metric("📈 Current Value", format_money(current_val))
-    m3.metric("🏦 FD Benchmark", format_money(compute_xirr.__defaults__ if False else (total_inv)))  # placeholder
-    m4.metric("📊 Net Gain", format_money(current_val - total_inv))
-    m5.metric("🚀 XIRR", xirr_display)
+    # Simple backtest (equal-weight over available ETFs)
+    with st.expander("▶ Backtest: Equal-Weight over last ~3 months", expanded=False):
+        eq_w = pd.Series(1/len(avail_etfs), index=avail_etfs)
+        equity = calc_equity_curve(prices, eq_w, start_val=100)
+        dd = drawdown_curve(equity)
 
-    # backtest sample - use available ETFs and simulate SIP monthly using available price history
-    st.markdown("### Backtest (SIP simulation on available history)")
-    backtest_df = simulate_sip(prices[avail_hold_etfs], sip_amount=15000)
-    if backtest_df.empty:
-        st.info("Not enough price history to run SIP backtest.")
-    else:
-        # equity curve plot
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df["Portfolio"], name="Portfolio"))
-        fig.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df["Invested"], name="Invested"))
-        fig.add_trace(go.Scatter(x=backtest_df.index, y=backtest_df["FD"], name="FD benchmark"))
-        fig.update_layout(title="Backtest Equity Curve", xaxis_title="Date", yaxis_title="Value (₹)")
-        st.plotly_chart(fig, use_container_width=True)
+        c3, c4 = st.columns(2)
+        with c3:
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name="Equity (EW)"))
+            fig.update_layout(title="Equity Curve", height=300, margin=dict(t=40,b=20))
+            st.plotly_chart(fig, use_container_width=True)
+        with c4:
+            fig2 = go.Figure()
+            fig2.add_trace(go.Scatter(x=dd.index, y=dd.values, mode="lines", name="Drawdown"))
+            fig2.update_layout(title="Max Drawdown (EW)", height=300, margin=dict(t=40,b=20), yaxis_tickformat=".1%")
+            st.plotly_chart(fig2, use_container_width=True)
 
-# ---------- TAB 2: Charts ----------
+# ---------------------------------------------
+# TAB 2: Charts
+# ---------------------------------------------
 with tab2:
     st.subheader("Charts")
 
-    # Drawdown chart
-    with st.expander("📉 Max Drawdown Chart", expanded=False):
-        # build normalized portfolio (equal weight of available ETFs)
-        norm = prices[avail_hold_etfs].divide(prices[avail_hold_etfs].iloc[0])
-        port = norm.mean(axis=1)
-        cummax = port.cummax()
-        drawdown = (port - cummax) / cummax
-        fig, ax = plt.subplots(figsize=(8,3))
-        drawdown.plot(ax=ax, color='red')
-        ax.set_title("Portfolio Drawdown (normalized average)")
-        ax.set_ylabel("Drawdown")
-        st.pyplot(fig)
+    # Equity Curve (EW) & Drawdown again for convenience
+    eq_w = pd.Series(1/len(avail_etfs), index=avail_etfs)
+    equity = calc_equity_curve(prices, eq_w, start_val=100)
+    dd = drawdown_curve(equity)
 
-    # Monthly heatmap
-    with st.expander("📅 Monthly Return Heatmap", expanded=False):
-        monthly = prices[avail_hold_etfs].resample("MS").last().pct_change().dropna()
-        monthly["Avg"] = monthly.mean(axis=1)
-        heat = (monthly["Avg"]*100).to_frame("Return")
-        heat["Year"] = heat.index.year
-        heat["Month"] = heat.index.month
-        pivot = heat.pivot(index="Year", columns="Month", values="Return").fillna(0)
-        fig, ax = plt.subplots(figsize=(10,4))
-        import seaborn as sns
-        sns.heatmap(pivot, annot=True, fmt=".1f", cmap="RdYlGn", center=0, ax=ax)
-        ax.set_title("Monthly Returns (%)")
-        st.pyplot(fig)
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=equity.index, y=equity.values, mode="lines", name="Equity (EW)"))
+        fig.update_layout(title="Equity Curve (EW)", height=300, margin=dict(t=40,b=20))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=dd.index, y=dd.values, mode="lines", name="Drawdown"))
+        fig2.update_layout(title="Drawdown (EW)", height=300, margin=dict(t=40,b=20), yaxis_tickformat=".1%")
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Monthly Return Heatmap (EW)
+    port_daily = prices.pct_change().dropna().mean(axis=1)
+    heat = monthly_heatmap(port_daily)
+    if not heat.empty:
+        fig3 = px.imshow(
+            heat,
+            text_auto=".0%",
+            aspect="auto",
+            color_continuous_scale="RdYlGn",
+            origin="upper"
+        )
+        fig3.update_layout(title="Monthly Return Heatmap (EW portfolio)", height=360, margin=dict(t=40,b=20))
+        st.plotly_chart(fig3, use_container_width=True)
+    else:
+        st.info("Not enough data for a monthly heatmap.")
 
     # All ETFs by 3-month return
-    with st.expander("📊 All ETFs by 3-Month Return", expanded=False):
-        last = prices.index[-1]
-        first = last - pd.DateOffset(months=3)
-        window = prices.loc[first:last]
-        if len(window) < 2:
-            st.warning("Not enough data to compute 3M returns.")
+    with st.expander("▶ All ETFs by ~3-month return", expanded=True):
+        three_mo_returns = {}
+        for c in avail_etfs:
+            s = prices[c].dropna()
+            if len(s) > 5:
+                three_mo_returns[c] = s.iloc[-1]/s.iloc[0] - 1
+        if three_mo_returns:
+            r = pd.Series(three_mo_returns).sort_values(ascending=False)
+            fig4 = px.bar(r, x=r.index, y=r.values, text=[f"{v*100:.1f}%" for v in r.values])
+            fig4.update_layout(title="ETFs by ~3-Month Return", yaxis_tickformat=".1%", height=360, margin=dict(t=40,b=20))
+            st.plotly_chart(fig4, use_container_width=True)
         else:
-            total_ret = ((window.iloc[-1] / window.iloc[0]) - 1) * 100
-            total_ret = total_ret.reindex(avail_hold_etfs).fillna(0).sort_values(ascending=False)
-            fig, ax = plt.subplots(figsize=(8, max(3, 0.5*len(total_ret))))
-            colors = ['green' if v>=0 else 'red' for v in total_ret.values]
-            bars = ax.barh(total_ret.index, total_ret.values, color=colors)
-            for bar, val in zip(bars, total_ret.values):
-                x = val + (1 if val >=0 else -1.5)
-                ha = "left" if val>=0 else "right"
-                ax.text(x, bar.get_y()+bar.get_height()/2, f"{val:.2f}%", va="center", ha=ha)
-            ax.invert_yaxis()
-            ax.set_xlabel("3-Month Return (%)")
-            ax.set_title("ETFs by 3-Month Return")
-            st.pyplot(fig)
+            st.info("No sufficient data to compute ~3-month returns.")
 
-    # Efficient frontier + tangent
-    with st.expander("📐 Efficient Frontier + CML & Tangent", expanded=True):
-        rets = prices[avail_hold_etfs].pct_change().dropna()
-        if rets.shape[0] < 2:
-            st.warning("Not enough returns to compute efficient frontier.")
+    # Efficient Frontier + CML + Tangent Portfolio
+    with st.expander("▶ Efficient Frontier + CML + Tangent Portfolio", expanded=False):
+        daily = prices.pct_change().dropna()
+        if daily.shape[1] >= 2 and len(daily) > 10:
+            mu_d = daily.mean().values
+            cov_d = daily.cov().values
+            mu_a, _ = annualize_daily(mu_d, daily.std().values)  # only mu_a used here
+            cov_a = cov_d * 252
+
+            # Frontier points
+            n_pts = 60
+            rng = np.linspace(0.0, 1.0, n_pts)
+            ef_x, ef_y = [], []
+            cols = list(prices.columns)
+            # Create random portfolios for frontier cloud
+            np.random.seed(42)
+            W = []
+            for _ in range(1000):
+                w = np.random.rand(len(cols))
+                w = w / w.sum()
+                W.append(w)
+            W = np.array(W)
+            rets = W @ mu_a
+            vols = np.sqrt(np.einsum('ij,jk,ik->i', W, cov_a, W))
+            sharpe = (rets - RISK_FREE) / np.where(vols==0, np.nan, vols)
+
+            # Tangent weights
+            w_tan = max_sharpe_weights(mu_a, cov_a, rf=RISK_FREE)
+            ret_tan = w_tan @ mu_a
+            vol_tan = np.sqrt(w_tan @ cov_a @ w_tan)
+            sharpe_tan = (ret_tan - RISK_FREE) / vol_tan if vol_tan>0 else np.nan
+
+            # Capital Market Line
+            cml_x = np.linspace(0, max(vols.max()*1.1, vol_tan*1.2), 50)
+            cml_y = RISK_FREE + sharpe_tan * cml_x
+
+            fig5 = go.Figure()
+            fig5.add_trace(go.Scatter(x=vols, y=rets, mode="markers", name="Random Portfolios", opacity=0.45))
+            fig5.add_trace(go.Scatter(x=[vol_tan], y=[ret_tan], mode="markers+text", name="Tangent (Max Sharpe)",
+                                      text=["Tangent"], textposition="top center", marker=dict(size=12)))
+            fig5.add_trace(go.Scatter(x=cml_x, y=cml_y, mode="lines", name="CML"))
+            fig5.update_layout(title="Efficient Frontier + CML", xaxis_title="Volatility (σ, annualized)",
+                               yaxis_title="Return (annualized)", height=420, margin=dict(t=50,b=20))
+            st.plotly_chart(fig5, use_container_width=True)
+
+            # Show tangent portfolio weights
+            w_series = pd.Series(w_tan, index=cols).sort_values(ascending=False)
+            st.write("**Tangent Portfolio (Max Sharpe) Weights:**")
+            st.dataframe(w_series.to_frame("Weight").style.format("{:.2%}"), use_container_width=True)
         else:
-            ef, weights_rand = simulate_efficient_frontier(rets, n_portf=3000, rf=RISK_FREE)
-            # compute tangent weights via optimizer with bounds min=0.5/n, max=2/n
-            n_assets = len(avail_hold_etfs)
-            min_w = 0.5 / n_assets
-            max_w = 2.0 / n_assets
-            tangent_w = optimize_weights(rets, risk_free_rate=RISK_FREE, min_weight=min_w, max_weight=max_w)
-            # compute tangent portfolio metrics
-            ann_mu = rets.mean() * 252
-            ann_cov = rets.cov() * 252
-            best_ret = float(tangent_w @ ann_mu)
-            best_vol = float(np.sqrt(tangent_w @ ann_cov.values @ tangent_w))
-            best_sr = (best_ret - RISK_FREE) / best_vol if best_vol>0 else 0
+            st.info("Need at least 2 ETFs and ~2 weeks of data to plot the frontier.")
 
-            # plot
-            fig, ax = plt.subplots(figsize=(8,5))
-            sc = ax.scatter(ef.Volatility, ef.Return, c=ef.Sharpe, cmap="viridis", alpha=0.6)
-            vol_lin = np.linspace(0, ef.Volatility.max()*1.1, 100)
-            ret_lin = RISK_FREE + best_sr * vol_lin
-            ax.plot(vol_lin, ret_lin, linewidth=2, label="CML")
-            ax.axhline(y=RISK_FREE, color='gray', linestyle='--', linewidth=1.2, label=f"FD ({RISK_FREE*100:.2f}%)")
-            ax.scatter([best_vol], [best_ret], marker="*", c="red", s=200, label=f"Tangent (SR {best_sr:.2f})")
-            ax.set_xlabel("Annual Volatility")
-            ax.set_ylabel("Annual Return")
-            ax.yaxis.set_major_formatter(PercentFormatter(1.0))
-            ax.set_title("Efficient Frontier with CML")
-            fig.colorbar(sc, label="Sharpe")
-            ax.legend(loc="upper left")
-            st.pyplot(fig)
-
-            # tangent allocation bar chart (as %)
-            st.subheader("🎯 Tangent Portfolio Allocation (Max Sharpe)")
-            tw = (tangent_w * 100).round(2)
-            fig2, ax2 = plt.subplots(figsize=(8,2 + 0.4*len(tw)))
-            ax2.bar(tw.index, tw.values)
-            ax2.set_ylabel("Weight (%)")
-            ax2.set_ylim(0, max(10, tw.max()*1.2))
-            for i, v in enumerate(tw.values):
-                ax2.text(i, v + 0.5, f"{v:.1f}%", ha='center')
-            st.pyplot(fig2)
-
-# ---------- TAB 3: Projections & Monte Carlo ----------
+# ---------------------------------------------
+# TAB 3: Future Projections
+# ---------------------------------------------
 with tab3:
-    st.subheader("🔮 Future SIP Projections")
-    MONTHLY_SIP = st.number_input("Monthly SIP used in projections (₹)", min_value=0, step=1000, value=15000)
+    st.subheader("Future Projections")
 
-    perf_df_rows = ["Invested","Portfolio","FD","Gain","CAGR","Beat_FD"]
-    # simple performance grid: use the backtest_df last row for base CAGR if available, else estimate from portfolio
-    base_cagr = backtest_df["CAGR"].iloc[-1] if (not backtest_df.empty and "CAGR" in backtest_df.columns) else 0.10
-    perf_df = pd.DataFrame(index=["σ=1.0,Sharpe>0.1"], columns=perf_df_rows)  # placeholder single-strat
-    perf_df.loc[:, "Invested"] = total_inv
-    perf_df.loc[:, "Portfolio"] = current_val
-    perf_df.loc[:, "FD"] = compute_xirr.__defaults__ if False else total_inv
-    perf_df.loc[:, "Gain"] = current_val - total_inv
-    perf_df.loc[:, "CAGR"] = base_cagr * 100
-    perf_df.loc[:, "Beat_FD"] = current_val > total_inv
+    MONTHLY_SIP = st.number_input("Enter Monthly SIP Amount (₹)", min_value=0, value=DEFAULT_MONTHLY_SIP, step=1000)
+    FD_RATE = st.number_input("FD Annual Rate", min_value=0.0, max_value=0.20, value=DEFAULT_FD_RATE, step=0.005, format="%.3f")
 
-    st.write("Performance Summary (simplified):")
-    st.dataframe(perf_df)
+    # Monte Carlo and projections are based on the portfolio daily returns
+    port_daily = prices.pct_change().dropna().mean(axis=1)
+    if port_daily.empty:
+        st.info("Not enough return history for projections.")
+    else:
+        c1, c2, c3 = st.columns(3)
+        for yrs, c in zip([5, 10, 15], [c1, c2, c3]):
+            with c:
+                st.markdown(f"**{yrs}-Year Monte Carlo**")
+                # Estimate mu/sigma from equal-weight daily portfolio
+                mu = port_daily.mean()
+                sigma = port_daily.std()
+                n_months = yrs * 12
+                sims = 4000
 
-    # future projections for horizons
-    horizons = [5, 10, 15]
-    rows_out = ["Total Invested","Portfolio","FD","Gain","CAGR","Beat_FD"]
-    for yrs in horizons:
-        st.markdown(f"**Over next {yrs} years**")
-        months = yrs * 12
-        out = []
-        base_r = base_cagr
-        if base_r > -1:
-            monthly_rate = (1 + base_r) ** (1/12) - 1
-            val = MONTHLY_SIP * (((1 + monthly_rate) ** months - 1) / monthly_rate)
-        else:
-            val = 0
-        fd_monthly = (1 + FD_RATE) ** (1/12) - 1
-        fdv = MONTHLY_SIP * (((1 + fd_monthly) ** months - 1) / fd_monthly)
-        inv = MONTHLY_SIP * months
-        gain = val - inv
-        cagr_p = compute_xirr.__defaults__ if False else 0
-        df_proj = pd.DataFrame({
-            "Value": [inv, val, fdv, gain, base_r*100, "✅" if val>fdv else "❌"]
-        }, index=rows_out)
-        st.dataframe(df_proj.style.format({0:"₹{:,.0f}"}), use_container_width=True)
+                results = np.zeros((sims, n_months + 1))
+                results[:, 0] = current_val
+                for i in range(sims):
+                    for t in range(1, n_months + 1):
+                        shock = np.random.normal(mu * 21, sigma * np.sqrt(21))  # 21 trading days ≈ month
+                        results[i, t] = results[i, t - 1] * (1 + shock) + MONTHLY_SIP
 
-    # Monte Carlo simulation
-    with st.expander("📈 Monte Carlo Simulation (SIP) — Open to provide SIP and horizons", expanded=True):
-        mc_monthly_sip = st.number_input("Monte Carlo Monthly SIP (₹)", min_value=0, step=1000, value=MONTHLY_SIP)
-        mc_sims = st.number_input("Simulations", min_value=200, max_value=20000, value=min(N_MONTE,2000), step=200)
-        mc_horizons = st.multiselect("Horizons (years) to simulate", options=[5,10,15], default=[5,15])
+                final_vals = results[:, -1]
+                fd_proj = compute_fd_with_sip(current_val, MONTHLY_SIP, yrs, FD_RATE)
+                beat_fd = np.mean(final_vals > fd_proj) * 100
 
-        # compute historic monthly mu/sigma from portfolio returns
-        daily = prices[avail_hold_etfs].pct_change().dropna()
-        if daily.empty:
-            st.warning("Not enough returns to run Monte Carlo.")
-        else:
-            port_daily = daily.mean(axis=1)
-            mu_d = float(port_daily.mean())
-            sigma_d = float(port_daily.std())
+                st.write(f"💰 **Monthly SIP**: {format_money(MONTHLY_SIP)}")
+                st.write(f"🧮 **Total Invested**: {format_money(MONTHLY_SIP*12*yrs)}")
+                st.write(f"📈 **Median value**: {format_money(np.median(final_vals))}")
+                st.write(f"🏦 **FD Benchmark ({yrs}Y @ {FD_RATE*100:.1f}%)**: {format_money(fd_proj)}")
+                st.write(f"✅ **% beating FD**: {beat_fd:.1f}%")
 
-            for yrs in mc_horizons:
-                nmonths = yrs * 12
-                results = np.zeros((mc_sims, nmonths+1))
-                results[:,0] = current_val
-                for i in range(mc_sims):
-                    for t in range(1, nmonths+1):
-                        # monthly shock from approx trading days (21)
-                        shock = np.random.normal(mu_d * 21, sigma_d * np.sqrt(21))
-                        results[i,t] = results[i,t-1] * (1 + shock) + mc_monthly_sip
-                final = results[:,-1]
-                fd_proj = current_val * ((1 + FD_RATE) ** yrs) + mc_monthly_sip * (((1 + FD_RATE) ** yrs - 1) / (FD_RATE/12))
-                pct_beat = (final > fd_proj).mean() * 100
-                med = np.median(final)
-                st.markdown(f"**{yrs} years** — Median: {format_money(med)} — % simulations > FD: {pct_beat:.1f}%")
-                # plot median and bands
-                pcts = np.percentile(results, [5,25,50,75,95], axis=0)
-                months = np.arange(nmonths+1) / 12.0
-                fig, ax = plt.subplots(figsize=(8,3.5))
-                ax.plot(months, pcts[2], label="Median")
-                ax.fill_between(months, pcts[1], pcts[3], alpha=0.3, label="25-75%")
-                ax.fill_between(months, pcts[0], pcts[4], alpha=0.15, label="5-95%")
-                ax.axhline(fd_proj, color="gray", linestyle="--", label=f"FD ({format_money(fd_proj)})")
-                ax.set_xlabel("Years")
-                ax.set_ylabel("Portfolio Value (₹)")
-                ax.yaxis.set_major_formatter(FuncFormatter(lambda x,_: f"₹{x:,.0f}"))
-                ax.legend()
-                st.pyplot(fig)
-
-# ---------- TAB 4: Tools / Others ----------
-with tab4:
-    st.subheader("Tools & Utilities")
-    st.markdown("""
-    - This public dashboard fetches price history (last 3 months) from NSE first, then Yahoo Finance if NSE isn't available.
-    - It uses only ETFs present in `trades.csv` and skips missing symbols.
-    - If you want faster runs, reduce the `DEFAULT_MONTHS` or the number of Monte Carlo simulations.
-    - To extend: add saving / exporting reports, heavier backtests, or user-uploaded trades.csv input.
-    """)
-    if st.button("Show available price columns & last date"):
-        st.write("Last date:", latest)
-        st.write("Columns:", prices.columns.tolist())
-
-# ============= End =============
+        st.markdown("---")
+        st.subheader("Required SIP for Target Goal")
+        target = st.number_input("Enter desired final portfolio value (₹)", min_value=0, step=100000, value=10_00_000)
+        # approximate CAGR from last 3 months → scale to annual
+        ann_mu = port_daily.mean() * 252
+        cagr_scenarios = {
+            "–10% CAGR": max(ann_mu - 0.10, -0.99),
+            "Actual CAGR": ann_mu,
+            "+10% CAGR": ann_mu + 0.10
+        }
+        horizons = [5, 10, 15]
+        req = pd.DataFrame(index=horizons, columns=cagr_scenarios.keys())
+        for yrs in horizons:
+            months = yrs * 12
+            for label, cagr in cagr_scenarios.items():
+                if cagr > -1:
+                    mrate = (1 + cagr)**(1/12) - 1
+                    sip = target * mrate / ((1 + mrate)**months - 1)
+                else:
+                    sip = np.nan
+                req.at[yrs, label] = sip
+        req.index.name = "Years"
+        st.table(req.applymap(lambda x: format_money(x) if pd.notna(x) else "—"))
 
