@@ -203,10 +203,18 @@ def fetch_prices_3m(etfs, lookback_days=90):
     prices = pd.DataFrame()
 
     for etf in etfs:
-        yf_symbol = ticker_map.get(etf)
-        if not yf_symbol:
-            st.warning(f"No Yahoo mapping for {etf}, skipping.")
-            continue
+    possible_symbols = [f"{etf}.NS", etf]
+    for yf_symbol in possible_symbols:
+        try:
+            df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
+            if not df.empty and "Close" in df.columns:
+                s = df["Close"].dropna()
+                s.name = etf  # <-- match exactly what trades.csv has
+                prices = pd.concat([prices, s], axis=1)
+                st.write(f"✅ Data fetched for {etf} ({yf_symbol})")
+                break
+        except Exception as e:
+            st.warning(f"yfinance fetch failed for {etf} using ticker '{yf_symbol}': {e}")
 
         try:
             df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
@@ -233,55 +241,6 @@ prices = fetch_prices_3m(trade_etfs, lookback_days=90)
 if prices.empty:
     st.error("No price data downloaded for any ETF. Aborting.")
     st.stop()
-# place this in your Streamlit app after the code that creates debug_raw_*.txt
-import glob, io, zipfile, os
-import streamlit as st
-
-st.sidebar.markdown("### 🔍 Debug files")
-dbg_files = sorted(glob.glob("debug_raw_*.txt"))
-
-if not dbg_files:
-    st.sidebar.info("No debug_raw_*.txt files found in app folder.")
-else:
-    for f in dbg_files:
-        st.sidebar.markdown(f"**{os.path.basename(f)}**")
-        try:
-            with open(f, "r", encoding="utf-8", errors="ignore") as fh:
-                text = fh.read()
-        except Exception as e:
-            st.sidebar.write(f"Could not read file: {e}")
-            continue
-
-        # show a short preview
-        preview = text[:3000]  # show first 3k chars
-        st.sidebar.code(preview, language="text")
-
-        # download button (single file)
-        st.sidebar.download_button(
-            label=f"Download {os.path.basename(f)}",
-            data=text,
-            file_name=os.path.basename(f),
-            mime="text/plain"
-        )
-
-    # Option: download all as a zip
-    if st.sidebar.button("Download all debug files as ZIP"):
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-            for f in dbg_files:
-                try:
-                    z.write(f, arcname=os.path.basename(f))
-                except Exception:
-                    # fallback: write file content manually
-                    with open(f, "rb") as fh:
-                        z.writestr(os.path.basename(f), fh.read())
-        buf.seek(0)
-        st.sidebar.download_button(
-            label="Download ZIP (all debug files)",
-            data=buf,
-            file_name="debug_raw_files.zip",
-            mime="application/zip"
-        )
 
 avail_etfs = [c for c in prices.columns if c in trade_etfs]
 if not avail_etfs:
