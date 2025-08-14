@@ -182,126 +182,175 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # Replace your previous fetch_prices_3m(...) with this NSE-aware implementation.
 # Requires: pip install nsepython
 
-from datetime import date
+# Paste this into your dashboard.py and call fetch_prices_3m_combined(trade_etfs, lookback_days=90)
+
+import os
+import time
+import traceback
+from datetime import date, datetime, timedelta
 import pandas as pd
 import numpy as np
-import traceback
 import streamlit as st
+import yfinance as yf
 
-def fetch_prices_3m_nse(etfs, lookback_days=90):
+def fetch_prices_3m_combined(etfs, lookback_days=90, verbose=True):
     """
-    Fetch ~3 months of daily close prices for the given ETF tickers from NSE via nsepython.
-    - Tries equity_history(symbol, series='EQ', start_date, end_date)
-    - Handles several return shapes (DataFrame, list/dict)
-    - Returns a DataFrame indexed by datetime with one column per available ETF.
+    Robust fetcher:
+      1) Try nsepython.equity_history(symbol, 'EQ', start_date, end_date)
+      2) parse many possible return shapes (DataFrame, list, dict)
+      3) fallback to yfinance attempts: SYMBOL.NS then SYMBOL
+      4) log / save raw responses for debugging if parsing fails
+    Returns a DataFrame indexed by datetime with one column per ETF (forward-filled).
     """
-    try:
-        from nsepython import equity_history
-    except Exception as e:
-        st.warning("nsepython not available (pip install nsepython). Falling back to yfinance or aborting.")
-        return pd.DataFrame()
-
     end_dt = date.today()
-    start_dt = end_dt - pd.Timedelta(days=lookback_days)
+    start_dt = end_dt - timedelta(days=lookback_days + 10)  # a bit of buffer
 
-    frames = []
-    ok_cols = []
-
-    # helper to normalise the output of equity_history
-    def _normalize_to_series(raw, symbol):
-        """
-        raw: anything returned by equity_history
-        returns: pd.Series indexed by datetime with closing prices named `symbol`,
-                 or None if parsing failed / no useful data.
-        """
+    # helper to normalize various raw outputs into a pd.Series of closes
+    def _normalize_raw_to_series(raw, symbol):
+        """Return pd.Series indexed by datetime, name = symbol, or None."""
         try:
-            # If already a DataFrame
+            if raw is None:
+                return None
+
+            # If it's already a DataFrame
             if isinstance(raw, pd.DataFrame):
                 df = raw.copy()
             else:
-                # Could be list of dicts or dict-of-lists
-                df = pd.DataFrame(raw)
+                # Maybe it's list-of-dicts or dict-of-lists or dict
+                try:
+                    df = pd.DataFrame(raw)
+                except Exception:
+                    return None
 
             if df.empty:
                 return None
 
-            # find date-like column
+            # 1) find date-like column
             date_col = None
             for c in df.columns:
-                if 'date' in c.lower() or 'timestamp' in c.lower() or 'time' in c.lower() or 'ch_timestamp' in c.lower():
+                cn = str(c).lower()
+                if any(k in cn for k in ("date","timestamp","time","ch_timestamp","trade_date")):
                     date_col = c
                     break
             if date_col is None:
-                # maybe index is already datetime-like
-                if isinstance(df.index, pd.DatetimeIndex):
-                    df = df.reset_index().rename(columns={'index':'__idx'}) 
-                    date_col = '__idx'
-                else:
-                    # try to find any column that parses as date
-                    for c in df.columns:
-                        try:
-                            pd.to_datetime(df[c].iloc[0])
-                            date_col = c
-                            break
-                        except Exception:
-                            continue
+                # try to parse first column as date
+                for c in df.columns:
+                    try:
+                        _ = pd.to_datetime(df[c].iloc[0])
+                        date_col = c
+                        break
+                    except Exception:
+                        continue
             if date_col is None:
                 return None
 
-            # find close-like column
+            # 2) find close-like column
             close_col = None
-            close_candidates = [c for c in df.columns if any(k in c.lower() for k in ['close', 'closing', 'ch_closing', 'close_price', 'closeprice', 'last']) ]
-            if close_candidates:
-                close_col = close_candidates[0]
+            closenames = [c for c in df.columns if any(k in str(c).lower() for k in ("close","closing","last","ch_closing","close_price"))]
+            if closenames:
+                close_col = closenames[0]
             else:
-                # try numeric columns excluding date_col
+                # use the last numeric column not equal to date_col
                 numeric_cols = [c for c in df.columns if c != date_col and np.issubdtype(df[c].dtype, np.number)]
                 if numeric_cols:
-                    close_col = numeric_cols[-1]  # last numeric column
+                    close_col = numeric_cols[-1]
+
             if close_col is None:
                 return None
 
             # build series
-            df[date_col] = pd.to_datetime(df[date_col], errors='coerce')
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
             df = df.dropna(subset=[date_col])
             df = df.sort_values(by=date_col)
-            s = pd.Series(pd.to_numeric(df[close_col], errors='coerce').values,
+            s = pd.Series(pd.to_numeric(df[close_col], errors="coerce").values,
                           index=pd.to_datetime(df[date_col]),
                           name=symbol).dropna()
             if s.empty:
                 return None
-            # resample to business day and forward-fill (makes it consistent)
-            s = s.resample('D').ffill()
+            # resample daily and forward-fill for alignment
+            s = s.resample("D").ffill()
             return s
         except Exception:
-            # parsing failed for this symbol
             return None
 
+    # Try NSE first (if available)
+    try:
+        from nsepython import equity_history
+        nse_available = True
+    except Exception as e:
+        nse_available = False
+        if verbose:
+            st.warning("nsepython not installed or import failed; skipping NSE fetch. Install via `pip install nsepython` to enable NSE fetching.")
+    
+    frames = []
+    succeeded = []
+    failed = []
     for symbol in etfs:
-        try:
-            # Call equity_history with series='EQ'
-            raw = equity_history(symbol, "EQ", start_dt.strftime("%d-%m-%Y"), end_dt.strftime("%d-%m-%Y"))
-            ser = _normalize_to_series(raw, symbol)
-            if ser is None or ser.dropna().empty:
-                st.warning(f"NSE data fetch returned no usable rows for {symbol}")
-                continue
-            frames.append(ser.rename(symbol))
-            ok_cols.append(symbol)
-        except Exception as exc:
-            # sometimes equity_history can raise various exceptions; don't abort overall run
-            st.warning(f"NSE data fetch failed for {symbol}: {exc}")
-            # optional: debug - uncomment next line during development only
-            # st.write(traceback.format_exc())
-            continue
+        ser = None
+        # 1) NSE path
+        if nse_available:
+            try:
+                # call equity_history(symbol, series, start_date, end_date)
+                # use 'EQ' series for equity/etf
+                raw = equity_history(symbol, "EQ", start_dt.strftime("%d-%m-%Y"), end_dt.strftime("%d-%m-%Y"))
+                # normalize
+                ser = _normalize_raw_to_series(raw, symbol)
+                if ser is None:
+                    # save raw repr for debugging
+                    rawfile = f"debug_raw_{symbol}_{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.txt"
+                    try:
+                        with open(rawfile, "w", encoding="utf-8") as fh:
+                            fh.write("REPR OF RAW FROM NSE:\n\n")
+                            fh.write(repr(raw))
+                        if verbose:
+                            st.warning(f"NSE data fetch returned no usable rows for {symbol} — raw saved to {rawfile}")
+                    except Exception:
+                        if verbose:
+                            st.warning(f"NSE returned unusable rows for {symbol}; could not save raw output.")
+                else:
+                    frames.append(ser.rename(symbol))
+                    succeeded.append((symbol, "NSE"))
+                    if verbose:
+                        st.success(f"NSE data OK for {symbol}.")
+            except Exception as exc:
+                failed.append((symbol, f"NSE_exc: {str(exc)[:200]}"))
+                if verbose:
+                    st.warning(f"NSE data fetch failed for {symbol}: {exc}")
+                # continue to fallback
+        # 2) fallback: yfinance attempts
+        if ser is None:
+            # try two symbol forms
+            tried = []
+            for sym in (f"{symbol}.NS", symbol):
+                try:
+                    df = yf.download(sym, start=start_dt, end=end_dt + timedelta(days=1), interval="1d", progress=False, auto_adjust=True)
+                    if isinstance(df, pd.DataFrame) and "Close" in df.columns and not df["Close"].dropna().empty:
+                        s = df["Close"].copy().rename(symbol).dropna()
+                        s = s.resample("D").ffill()
+                        frames.append(s)
+                        succeeded.append((symbol, f"YF:{sym}"))
+                        if verbose:
+                            st.success(f"yfinance OK for {symbol} using {sym}")
+                        ser = s
+                        break
+                except Exception as exc:
+                    tried.append((sym, str(exc)[:200]))
+                    continue
+            if ser is None and verbose:
+                st.warning(f"Price data not found for {symbol} via NSE or yfinance (tried NSE + { [f'{symbol}.NS', symbol] }).")
 
     if not frames:
+        if verbose:
+            st.error("No price data downloaded for any ETF. Aborting.")
         return pd.DataFrame()
 
-    df = pd.concat(frames, axis=1).sort_index().ffill()
-    # trim to exactly last lookback_days
-    cutoff = pd.Timestamp(end_dt) - pd.Timedelta(days=lookback_days)
-    df = df[df.index >= cutoff]
-    return df
+    df_all = pd.concat(frames, axis=1).sort_index().ffill()
+    # trim to lookback_days exactly
+    cutoff = pd.Timestamp(date.today() - timedelta(days=lookback_days))
+    df_all = df_all[df_all.index >= cutoff]
+    # remove columns with all NaNs
+    df_all = df_all.loc[:, df_all.notna().any(axis=0)]
+    return df_all
 
     
 prices = fetch_prices_3m_nse(trade_etfs)
