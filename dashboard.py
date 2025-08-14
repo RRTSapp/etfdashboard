@@ -187,11 +187,11 @@ def fetch_prices_3m(etfs, lookback_days=90):
     Returns: DataFrame indexed by date, columns = ETFs
     """
     try:
-        from nsepython import nsefetch, nse_eq
-        from nsepython import nse_stock_df
+        from nsepython import get_history
+        nse_available = True
     except ImportError:
-        st.warning("nsepython not available, using yfinance only.")
-        return fetch_prices_yf(etfs, lookback_days)
+        st.warning("nsepython not available, will use yfinance only.")
+        nse_available = False
 
     end_dt = date.today()
     start_dt = end_dt - pd.Timedelta(days=lookback_days)
@@ -201,20 +201,20 @@ def fetch_prices_3m(etfs, lookback_days=90):
         data_fetched = False
 
         # --- Try nsepython ---
-        try:
-            from nsepython import get_history
-            df = get_history(symbol=symbol,
-                             start=start_dt,
-                             end=end_dt,
-                             index=False)
-            if not df.empty and "Close" in df.columns:
-                s = df["Close"]
-                s.index = pd.to_datetime(df["Date"])
-                s = s.resample("D").ffill()
-                frames.append(s.rename(symbol))
-                data_fetched = True
-        except Exception as e:
-            st.warning(f"NSE fetch failed for {symbol}: {e}")
+        if nse_available:
+            try:
+                df = get_history(symbol=symbol,
+                                 start=start_dt,
+                                 end=end_dt,
+                                 index=False)
+                if not df.empty and "Close" in df.columns:
+                    s = df["Close"]
+                    s.index = pd.to_datetime(df["Date"])
+                    s = s.resample("D").ffill()
+                    frames.append(s.rename(symbol))
+                    data_fetched = True
+            except Exception as e:
+                st.warning(f"NSE fetch failed for {symbol}: {e}")
 
         # --- Fallback to yfinance ---
         if not data_fetched:
@@ -236,8 +236,7 @@ def fetch_prices_3m(etfs, lookback_days=90):
     df_all = pd.concat(frames, axis=1).sort_index().ffill()
     cutoff = pd.Timestamp(end_dt) - pd.Timedelta(days=lookback_days)
     return df_all[df_all.index >= cutoff]
-
-    
+   
 prices = fetch_prices_3m(trade_etfs, lookback_days=90)
 if prices.empty:
     st.error("No price data downloaded for any ETF. Aborting.")
