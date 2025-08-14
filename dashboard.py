@@ -217,7 +217,7 @@ def fetch_prices_3m(etfs, lookback_days=90):
                 st.warning(f"yfinance fetch failed for {etf} using ticker '{yf_symbol}': {e}")
 
             if not fetched:
-            st.warning(f"Price data not found for {etf} (tried: {possible_symbols}). Skipping.")
+                st.warning(f"Price data not found for {etf} (tried: {possible_symbols}). Skipping.")
         return prices
 
 
