@@ -179,79 +179,66 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # ---------------------------------------------
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
-from datetime import date
-import pandas as pd
-import numpy as np
-import traceback
-import streamlit as st
-
-def fetch_prices_3m_nse(etfs, lookback_days=90):
+def fetch_prices_3m(etfs, lookback_days=90):
     """
-    Fetch ~3 months of daily close prices for the given ETF tickers from NSE via nselib.
-    - Uses nselib.capital_market.price_volume_and_deliverable_position_data for historical data.
-    - Returns a DataFrame indexed by datetime with one column per available ETF.
+    Fetch ~3 months of daily close prices for given ETFs using:
+    1. nsepython.get_history
+    2. yfinance fallback
+    Returns: DataFrame indexed by date, columns = ETFs
     """
     try:
-        from nselib import capital_market
-    except Exception as e:
-        st.warning("nselib not available (pip install nselib). Falling back to yfinance or aborting.")
-        return pd.DataFrame()
+        from nsepython import nsefetch, nse_eq
+        from nsepython import nse_stock_df
+    except ImportError:
+        st.warning("nsepython not available, using yfinance only.")
+        return fetch_prices_yf(etfs, lookback_days)
 
     end_dt = date.today()
     start_dt = end_dt - pd.Timedelta(days=lookback_days)
-
     frames = []
-    ok_cols = []
 
     for symbol in etfs:
+        data_fetched = False
+
+        # --- Try nsepython ---
         try:
-            # nselib.capital_market.price_volume_and_deliverable_position_data expects dates as strings in DD-MM-YYYY format
-            raw_data = capital_market.price_volume_and_deliverable_position_data(
-                symbol=symbol,
-                from_date=start_dt.strftime("%d-%m-%Y"),
-                to_date=end_dt.strftime("%d-%m-%Y")
-            )
+            from nsepython import get_history
+            df = get_history(symbol=symbol,
+                             start=start_dt,
+                             end=end_dt,
+                             index=False)
+            if not df.empty and "Close" in df.columns:
+                s = df["Close"]
+                s.index = pd.to_datetime(df["Date"])
+                s = s.resample("D").ffill()
+                frames.append(s.rename(symbol))
+                data_fetched = True
+        except Exception as e:
+            st.warning(f"NSE fetch failed for {symbol}: {e}")
 
-            if raw_data is None or raw_data.empty:
-                st.warning(f"NSE data fetch returned no usable rows for {symbol} using nselib.")
-                continue
+        # --- Fallback to yfinance ---
+        if not data_fetched:
+            try:
+                s = yf.download(f"{symbol}.NS", start=start_dt, end=end_dt)["Close"].rename(symbol)
+                s = s.resample("D").ffill()
+                if not s.empty:
+                    frames.append(s)
+                    data_fetched = True
+            except Exception as e:
+                st.warning(f"yfinance fetch failed for {symbol}: {e}")
 
-            # Assuming the 'Close Price' column contains the closing prices and 'Date' contains the date
-            # Adjust column names if different in the nselib output for price_volume_and_deliverable_position_data
-            df = raw_data.copy()
-            df['Date'] = pd.to_datetime(df['Date'], errors='coerce', format='%d-%m-%Y')
-            df = df.dropna(subset=['Date', 'Close Price'])  # Ensure both date and close price are present
-            df = df.sort_values(by='Date')
-            s = pd.Series(pd.to_numeric(df['Close Price'], errors='coerce').values,
-                          index=df['Date'],
-                          name=symbol).dropna()
-            
-            if s.empty:
-                st.warning(f"NSE data fetch returned no usable rows for {symbol} after processing.")
-                continue
-
-            # Resample to business day and forward-fill (makes it consistent)
-            s = s.resample('D').ffill()
-            frames.append(s.rename(symbol))
-            ok_cols.append(symbol)
-
-        except Exception as exc:
-            st.warning(f"NSE data fetch failed for {symbol} using nselib: {exc}")
-            # optional: debug - uncomment next line during development only
-            # st.write(traceback.format_exc())
-            continue
+        if not data_fetched:
+            st.warning(f"No data found for {symbol} in NSE or yfinance.")
 
     if not frames:
         return pd.DataFrame()
 
-    df = pd.concat(frames, axis=1).sort_index().ffill()
-    # trim to exactly last lookback_days
+    df_all = pd.concat(frames, axis=1).sort_index().ffill()
     cutoff = pd.Timestamp(end_dt) - pd.Timedelta(days=lookback_days)
-    df = df[df.index >= cutoff]
-    return df
+    return df_all[df_all.index >= cutoff]
 
     
-prices = fetch_prices_3m_nse(trade_etfs, lookback_days=90)
+prices = fetch_prices_3m(trade_etfs, lookback_days=90)
 if prices.empty:
     st.error("No price data downloaded for any ETF. Aborting.")
     st.stop()
