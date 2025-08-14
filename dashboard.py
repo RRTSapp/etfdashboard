@@ -179,28 +179,96 @@ st.caption("Price data will be fetched for the last ~3 months (90 calendar days)
 # ---------------------------------------------
 # Fetch last 3 months prices (daily) - yfinance
 # ---------------------------------------------
+# replace your existing fetch_prices_3m with this function
 def fetch_prices_3m(etfs, lookback_days=90):
+    """
+    Fetch last `lookback_days` of daily close prices for the given ETF tickers using yfinance.
+    - Tries ticker formats: SYMBOL.NS then SYMBOL
+    - Returns DataFrame indexed by date with columns = successful ETF symbols
+    - Skips tickers with no usable data
+    """
+    import traceback
     from datetime import date, timedelta
-    """Fetch last `lookback_days` of daily close prices for ETFs via yfinance only."""
+
+    # Defensive check: ensure 'yf' is the yfinance module and not accidentally overwritten
+    try:
+        import yfinance as _yf_check
+    except Exception:
+        _yf_check = None
+
+    if _yf_check is None or (not hasattr(_yf_check, "download")):
+        st.error("yfinance not imported correctly or has been overwritten. "
+                 "Please ensure `import yfinance as yf` appears once at top of the file and that `yf` is not reassigned.")
+        return pd.DataFrame()
+
+    if isinstance(yf, str) or not hasattr(yf, "download"):
+        st.error("The name `yf` is not the yfinance module (it appears to be overwritten). Restart Streamlit and ensure `import yfinance as yf` is used and not reassigned.")
+        return pd.DataFrame()
+
     end_dt = date.today()
     start_dt = end_dt - timedelta(days=lookback_days)
+
     frames = []
-    ok_cols = []
+    successful = []
+
+    # download each ticker individually so we can surface per-ticker errors
     for symbol in etfs:
-        try:
-            df = yf.download(f"{symbol}.NS", start=start_dt, end=end_dt, progress=False)
-            if df.empty:
-                st.warning(f"No data found for {symbol} in yfinance.")
+        symbol = str(symbol).strip().upper()
+        tried = []
+        got = False
+
+        # try common candidate forms (you can extend this list)
+        ticker_candidates = [f"{symbol}.NS", symbol]
+
+        for tkr in ticker_candidates:
+            tried.append(tkr)
+            try:
+                # use explicit start/end in YYYY-MM-DD to avoid timezone issues
+                df = yf.download(
+                    tkr,
+                    start=start_dt.strftime("%Y-%m-%d"),
+                    end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),  # inclusive
+                    progress=False,
+                    threads=False,
+                )
+                # df may be DataFrame or dict-like; check
+                if df is None or df.empty or "Close" not in df.columns:
+                    # no usable data for this candidate
+                    continue
+
+                s = df["Close"].dropna().rename(symbol)
+                if s.empty:
+                    continue
+
+                # resample/ffill daily to keep index consistent (business days)
+                s = s.sort_index().asfreq("D").ffill()
+                frames.append(s)
+                successful.append(symbol)
+                got = True
+                break
+
+            except Exception as e:
+                # show the real traceback in the Streamlit logs so you can debug root cause
+                st.warning(f"yfinance fetch failed for {symbol} using ticker '{tkr}': {e}")
+                st.text(traceback.format_exc())
                 continue
-            s = df["Close"].dropna().rename(symbol)
-            frames.append(s)
-            ok_cols.append(symbol)
-        except Exception as e:
-            st.warning(f"yfinance fetch failed for {symbol}: {e}")
-            continue
+
+        if not got:
+            st.info(f"No price data found for {symbol} (tried: {tried}). Skipping.")
+
     if not frames:
-       return pd.DataFrame()
-    return pd.concat(frames, axis=1).ffill()
+        return pd.DataFrame()
+
+    df = pd.concat(frames, axis=1).sort_index().ffill()
+
+    # trim to last N days (calendar days)
+    cutoff = pd.Timestamp(end_dt) - pd.Timedelta(days=lookback_days)
+    df = df[df.index >= cutoff]
+
+    # final sanity: drop columns that are all NaN
+    df = df.dropna(axis=1, how="all")
+
+    return df
    
 prices = fetch_prices_3m(trade_etfs, lookback_days=90)
 if prices.empty:
