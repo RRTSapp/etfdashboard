@@ -185,24 +185,13 @@ def fetch_prices_3m(etfs, lookback_days=90):
     Fetch last `lookback_days` of daily close prices for the given ETF tickers using yfinance.
     - Tries ticker formats: SYMBOL.NS then SYMBOL
     - Returns DataFrame indexed by date with columns = successful ETF symbols
-    - Skips tickers with no usable data
     """
-    import traceback
     from datetime import date, timedelta
+    import traceback
 
-    # Defensive check: ensure 'yf' is the yfinance module and not accidentally overwritten
-    try:
-        import yfinance as _yf_check
-    except Exception:
-        _yf_check = None
-
-    if _yf_check is None or (not hasattr(_yf_check, "download")):
-        st.error("yfinance not imported correctly or has been overwritten. "
-                 "Please ensure `import yfinance as yf` appears once at top of the file and that `yf` is not reassigned.")
-        return pd.DataFrame()
-
-    if isinstance(yf, str) or not hasattr(yf, "download"):
-        st.error("The name `yf` is not the yfinance module (it appears to be overwritten). Restart Streamlit and ensure `import yfinance as yf` is used and not reassigned.")
+    # Defensive check for yfinance
+    if not (hasattr(yf, "download") and callable(yf.download)):
+        st.error("yfinance appears to be unavailable or overwritten. Ensure `import yfinance as yf` at top and restart the app.")
         return pd.DataFrame()
 
     end_dt = date.today()
@@ -211,44 +200,41 @@ def fetch_prices_3m(etfs, lookback_days=90):
     frames = []
     successful = []
 
-    # download each ticker individually so we can surface per-ticker errors
     for symbol in etfs:
         symbol = str(symbol).strip().upper()
         tried = []
         got = False
 
-        # try common candidate forms (you can extend this list)
         ticker_candidates = [f"{symbol}.NS", symbol]
 
         for tkr in ticker_candidates:
             tried.append(tkr)
             try:
-                # use explicit start/end in YYYY-MM-DD to avoid timezone issues
                 df = yf.download(
                     tkr,
                     start=start_dt.strftime("%Y-%m-%d"),
-                    end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),  # inclusive
+                    end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"),
                     progress=False,
                     threads=False,
                 )
-                # df may be DataFrame or dict-like; check
                 if df is None or df.empty or "Close" not in df.columns:
-                    # no usable data for this candidate
                     continue
 
-                s = df["Close"].dropna().rename(symbol)
+                # Extract close series safely and avoid ambiguous rename(...)
+                s = df["Close"].dropna().copy()
                 if s.empty:
                     continue
 
-                # resample/ffill daily to keep index consistent (business days)
+                # ensure datetime index and forward-fill calendar days
+                s.index = pd.to_datetime(s.index)
                 s = s.sort_index().asfreq("D").ffill()
+                s.name = symbol   # set series name explicitly (avoid Series.rename ambiguity)
                 frames.append(s)
                 successful.append(symbol)
                 got = True
                 break
 
             except Exception as e:
-                # show the real traceback in the Streamlit logs so you can debug root cause
                 st.warning(f"yfinance fetch failed for {symbol} using ticker '{tkr}': {e}")
                 st.text(traceback.format_exc())
                 continue
@@ -259,16 +245,15 @@ def fetch_prices_3m(etfs, lookback_days=90):
     if not frames:
         return pd.DataFrame()
 
-    df = pd.concat(frames, axis=1).sort_index().ffill()
-
-    # trim to last N days (calendar days)
+    # concat and trim to lookback window
+    df_all = pd.concat(frames, axis=1).sort_index().ffill()
     cutoff = pd.Timestamp(end_dt) - pd.Timedelta(days=lookback_days)
-    df = df[df.index >= cutoff]
+    df_all = df_all[df_all.index >= cutoff]
 
-    # final sanity: drop columns that are all NaN
-    df = df.dropna(axis=1, how="all")
+    # final sanity: drop all-NaN columns
+    df_all = df_all.dropna(axis=1, how="all")
+    return df_all
 
-    return df
    
 prices = fetch_prices_3m(trade_etfs, lookback_days=90)
 if prices.empty:
