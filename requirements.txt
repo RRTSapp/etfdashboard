@@ -7,3 +7,4 @@ plotly
 yfinance
 scipy
 nsepython
+nselib
