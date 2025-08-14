@@ -203,37 +203,37 @@ def fetch_prices_3m(etfs, lookback_days=90):
     prices = pd.DataFrame()
 
     for etf in etfs:
-    possible_symbols = [f"{etf}.NS", etf]
-    for yf_symbol in possible_symbols:
-        try:
-            df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
-            if not df.empty and "Close" in df.columns:
+        possible_symbols = [f"{etf}.NS", etf]
+        for yf_symbol in possible_symbols:
+            try:
+                df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
+                if not df.empty and "Close" in df.columns:
+                    s = df["Close"].dropna()
+                    s.name = etf  # <-- match exactly what trades.csv has
+                    prices = pd.concat([prices, s], axis=1)
+                    st.write(f"✅ Data fetched for {etf} ({yf_symbol})")
+                    break
+            except Exception as e:
+                st.warning(f"yfinance fetch failed for {etf} using ticker '{yf_symbol}': {e}")
+
+            try:
+                df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
+                if df.empty or "Close" not in df.columns:
+                    st.warning(f"No price data for {etf} ({yf_symbol}). Skipping.")
+                    continue
                 s = df["Close"].dropna()
-                s.name = etf  # <-- match exactly what trades.csv has
+                s.name = etf
                 prices = pd.concat([prices, s], axis=1)
-                st.write(f"✅ Data fetched for {etf} ({yf_symbol})")
-                break
-        except Exception as e:
-            st.warning(f"yfinance fetch failed for {etf} using ticker '{yf_symbol}': {e}")
-
-        try:
-            df = yf.download(yf_symbol, start=start_dt, end=end_dt, progress=False)
-            if df.empty or "Close" not in df.columns:
-                st.warning(f"No price data for {etf} ({yf_symbol}). Skipping.")
+            except Exception as e:
+                st.warning(f"{etf} fetch failed: {e}")
                 continue
-            s = df["Close"].dropna()
-            s.name = etf
-            prices = pd.concat([prices, s], axis=1)
-        except Exception as e:
-            st.warning(f"{etf} fetch failed: {e}")
-            continue
 
-    if prices.empty:
-        st.error("No price data fetched for any ETF. Proceeding without charts/backtests.")
-    else:
-        st.success(f"Fetched data for {len(prices.columns)} ETFs: {', '.join(prices.columns)}")
+        if prices.empty:
+            st.error("No price data fetched for any ETF. Proceeding without charts/backtests.")
+        else:
+            st.success(f"Fetched data for {len(prices.columns)} ETFs: {', '.join(prices.columns)}")
 
-    return prices
+        return prices
 
 
    
